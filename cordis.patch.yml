@@ -1,0 +1,15 @@
+# @dsh-web/llm-deepseek-web profile patch: mounts the DeepSeek WEB-session
+# LLM adapter as a first-class provider route alongside any existing adapters
+# (deepseek-official / pi-ai profiles stay untouched — the default provider is
+# preserved, deepseek-web is an additional selectable route).
+#
+# This bundle patch is applied after dsh-base (which mounts llm-deepseek and
+# agent-default-model) and after dsh-web-app. It only INSERTs a new row; it
+# overrides nothing, so the deployment default provider remains whatever
+# agent-default-model / the user settings document select.
+
+- insert:
+    - id: llm-deepseek-web
+      name: '@dsh-web/llm-deepseek-web'
+      config:
+        port: 3117

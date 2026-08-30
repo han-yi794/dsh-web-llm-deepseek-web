@@ -1,0 +1,8 @@
+# Build output & deps (regenerated via `prepare` on install)
+dist/
+node_modules/
+
+# Logs / OS noise
+*.log
+Thumbs.db
+.DS_Store
