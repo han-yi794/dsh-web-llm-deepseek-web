@@ -1,36 +1,35 @@
 # @dsh-web/llm-deepseek-web
 
-dsh plugin: **DeepSeek WEB-session LLM adapter** — drives the free
-[chat.deepseek.com](https://chat.deepseek.com) session as a model provider
-inside the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
+**dsh 插件:DeepSeek 网页会话 LLM 适配器**
 
-Instead of an API key, the adapter relays model calls to the logged-in web
-session. The browser companion extension (`dsh-web` project) captures the
-session's verbatim request headers and bridges them into the dsh runtime, so
-the free web subscription becomes a usable harness model route.
+将免费的 [chat.deepseek.com](https://chat.deepseek.com) 网页登录会话,作为
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)(dsh)
+的一个模型供应商来驱动。
 
-## Features
+与需要 API Key 不同,本适配器把模型调用中继到已登录的网页会话。配套的
+浏览器扩展(`dsh-web` 项目)捕获会话的逐字请求头,并桥接进 dsh 运行时,让
+免费网页订阅成为可用的 harness 模型路由。
 
-- Two model modes over one provider route:
-  - `deepseek-expert` — 深度推理（专家）模式
+## 功能特性
+
+- 单一供应商路由下提供两种模型模式:
+  - `deepseek-expert` — 深度推理(专家)模式
   - `deepseek-vision` — 识图模式
-- Full dsh ecosystem compatibility: ships as a Cordis bundle patch, mounts
-  alongside the official `deepseek-official` / `pi-ai` routes.
-- Per-(dsh session, mode) web conversation chain isolation — sessions never
-  share chat.deepseek.com context.
-- Global request gate (pp-style anti-burst): every DeepSeek web request is
-  spaced by a minimum interval so agent runs and concurrent sessions don't
-  hammer chat.deepseek.com.
-- Provider retry policy exposed to the official `dsh-llm-retry` plugin
-  (`RATE_LIMIT` on 429).
+- 完整的 dsh 生态兼容:以 Cordis bundle patch 形式分发,与官方
+  `deepseek-official` / `pi-ai` 路由并列挂载,互不覆盖。
+- **按(dsh 会话, 模式)隔离网页对话链** — 不同 dsh 会话绝不共享
+  chat.deepseek.com 上下文。
+- **全局请求门控**(仿 pp 防突发):每个 DeepSeek 网页请求至少间隔最小
+  时间,避免 agent 运行与并发会话对 chat.deepseek.com 造成请求风暴。
+- 向官方 `dsh-llm-retry` 插件暴露供应商重试策略(429 时上报 `RATE_LIMIT`)。
 
-## Installation
+## 安装
 
 ```bash
 npm install @dsh-web/llm-deepseek-web
 ```
 
-Register the bundle in the profile's `package.json` (or `cordis.yml`):
+在 profile 的 `package.json`(或 `cordis.yml`)中注册 bundle:
 
 ```jsonc
 {
@@ -43,36 +42,45 @@ Register the bundle in the profile's `package.json` (or `cordis.yml`):
         "@deepseek-ai/dsh-base",
         "@deepseek-ai/dsh-web-app",
         "@dsh-web/llm-deepseek-web",
-        // ...other bundles
+        // ...其他 bundle
       ]
     }
   }
 }
 ```
 
-## Usage
+## 使用方法
 
-1. Start dsh with the web profile (`dsh web`).
-2. Open `http://127.0.0.1:3080`, create a session, select
-   `deepseek-web` / `deepseek-expert` (or `deepseek-vision`).
-3. The web session login is provided by the companion browser extension; a
-   logged-in chat.deepseek.com tab is required for generation.
+1. 用 web profile 启动 dsh:`dsh web`
+2. 打开 `http://127.0.0.1:3080`,创建会话,选择
+   `deepseek-web` / `deepseek-expert`(或 `deepseek-vision`)。
+3. 网页登录态由配套浏览器扩展提供;生成前需要一个已登录的
+   chat.deepseek.com 标签页。
 
-## Configuration
+## 配置项
 
-| Key | Default | Meaning |
+| 键 | 默认值 | 含义 |
 |---|---|---|
-| `port` | `3117` | Loopback port the extension's relay polls |
-| `requestDelayMinMs` | `2500` | Min pacing between generations (after the first) |
-| `requestDelayMaxMs` | `6500` | Max pacing between generations (after the first) |
-| `retryPolicy` | normal defaults | Provider retry policy (consumed by `dsh-llm-retry`) |
+| `port` | `3117` | 扩展 relay 轮询的回环端口 |
+| `requestDelayMinMs` | `2500` | 生成之间的最小节奏(首个之后) |
+| `requestDelayMaxMs` | `6500` | 生成之间的最大节奏(首个之后) |
+| `retryPolicy` | 常规默认 | 供应商重试策略(由 `dsh-llm-retry` 消费) |
 
-The global per-request gate (default 2500 ms) can be overridden at runtime via
-`setDeepSeekRequestMinInterval()`.
+全局每请求门控(默认 2500 ms)可在运行时通过
+`setDeepSeekRequestMinInterval()` 覆盖。
 
-## License
+## 许可证
 
-Apache-2.0. Includes code ported from
-[DeepSeek++](https://github.com/zhu1090093659/deepseek-pp) — see
-[NOTICE.md](./NOTICE.md). Interfaces with DeepSeek Harness (MIT) through its
-public plugin API.
+Apache-2.0。包含从
+[DeepSeek++](https://github.com/zhu1090093659/deepseek-pp) 移植的代码 ——
+参见 [NOTICE.md](./NOTICE.md)。通过其公共插件 API 与 DeepSeek Harness
+(MIT) 对接。
+
+---
+
+## English Summary
+
+`@dsh-web/llm-deepseek-web` is a dsh plugin that drives the free
+chat.deepseek.com web session as a model provider. See the Chinese sections
+above for features, installation, usage, and configuration. Licensed under
+Apache-2.0; see [NOTICE.md](./NOTICE.md) for deepseek-pp attribution.

@@ -1,22 +1,31 @@
 NOTICE
 ======
 
-This package includes code ported from DeepSeek++ (deepseek-pp)
+本包包含从 DeepSeek++(deepseek-pp)移植的代码
 
   https://github.com/zhu1090093659/deepseek-pp
 
-Copyright (c) the deepseek-pp authors, licensed under the Apache License,
-Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+版权所有 (c) deepseek-pp 作者,依据 Apache License, Version 2.0 许可
+(http://www.apache.org/licenses/LICENSE-2.0)。
 
-Ported sources (carrying their own upstream headers):
+移植的源文件(各自带有上游文件头声明):
 
-  - `src/xml-stream-parser.ts` — patterns from deepseek-pp
-    `core/interceptor/streaming-tool-call-parser.ts` (linear-time tag scanning;
-    artifact externalization machinery not shipped).
-  - `src/xml-tools.ts` — ported from deepseek-pp `core/tool/xml-tags.ts`.
+  - `src/xml-stream-parser.ts` — 源自 deepseek-pp
+    `core/interceptor/streaming-tool-call-parser.ts`(线性时间标签扫描;
+    不包含未随附的产物外部化机制)。
+  - `src/xml-tools.ts` — 移植自 deepseek-pp `core/tool/xml-tags.ts`。
 
-Upstream commit: 0a02c72b135bf2936e11aa78fd6136931ed65908 (2026-08-14).
+上游提交:0a02c72b135bf2936e11aa78fd6136931ed65908 (2026-08-14)。
 
-The package interfaces with DeepSeek Harness
-(https://github.com/deepseek-ai/deepseek-harness, MIT) through its public
-plugin API; it does not include or fork harness internals.
+本包通过其公共插件 API 与 DeepSeek Harness
+(https://github.com/deepseek-ai/deepseek-harness,MIT) 对接;
+不包含也不派生 harness 内部实现。
+
+---
+
+## English Summary
+
+This package includes code ported from DeepSeek++ (deepseek-pp), licensed
+under Apache-2.0. See the Chinese sections above for the exact attribution and
+upstream commit. The package interfaces with DeepSeek Harness (MIT) through its
+public plugin API only.
