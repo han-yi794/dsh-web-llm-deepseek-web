@@ -14,20 +14,16 @@ const TEXT_INDEX = 0;
 const REASONING_INDEX = 1;
 const FIRST_TOOL_INDEX = 2;
 
-// The DeepSeek web session serves two model modes, selected by the model id
-// in the catalog. The wire never names a model — the session is bound to your
-// logged-in account — but the WEB model_type header selects expert (deep
-// reasoning) or vision (image input).
-const WEB_EXPERT_ID = 'deepseek-expert';
-const WEB_VISION_ID = 'deepseek-vision';
-const WEB_EXPERT_NAME = 'DeepSeek Web (专家)';
-const WEB_VISION_NAME = 'DeepSeek Web (识图)';
+// chat.deepseek.com exposes ONE model entry (built-in vision). The wire never
+// names a model — the session is bound to your logged-in account — and the
+// single model entry uses the `default` wire model_type.
+const WEB_MODEL_ID = 'deepseek-web';
+const WEB_MODEL_NAME = 'DeepSeek Web';
 
 /** Map a catalog model id to the deepseek web wire `model_type`. */
-function modelTypeForModel(model: string | undefined): string {
-  if (model === WEB_VISION_ID) return 'vision';
-  // deepseek-expert and any other id ride the expert (deep reasoning) wire mode.
-  return 'expert';
+function modelTypeForModel(_model: string | undefined): string {
+  // Single web model entry; vision is built in. Always the default wire mode.
+  return 'default';
 }
 
 /** Abortable sleep used by request pacing. */
@@ -96,24 +92,18 @@ export class DeepSeekWebAdapter extends LlmAdapter {
   }
 
   /**
-   * Advertise the two DeepSeek web model modes as advisory catalog entries.
-   * The web session serves the logged-in account; the model id selects the
-   * wire model_type (expert / vision). Absence is never a rejection — the
-   * adapter accepts any model id (unlisted ids map to the expert mode).
+   * Advertise the single DeepSeek web model entry as an advisory catalog item.
+   * The web session serves the logged-in account; the model entry uses the
+   * `default` wire model_type. Absence is never a rejection — the adapter
+   * accepts any model id.
    */
   override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
     return Promise.resolve([
       {
         provider,
-        id: WEB_EXPERT_ID,
-        name: WEB_EXPERT_NAME,
-        description: '专家模式（深度推理），免费，经 chat.deepseek.com 会话。',
-      },
-      {
-        provider,
-        id: WEB_VISION_ID,
-        name: WEB_VISION_NAME,
-        description: '识图模式，免费，经 chat.deepseek.com 会话。',
+        id: WEB_MODEL_ID,
+        name: WEB_MODEL_NAME,
+        description: 'DeepSeek 网页会话（内置视觉），免费，经 chat.deepseek.com 登录态。',
       },
     ]);
   }
