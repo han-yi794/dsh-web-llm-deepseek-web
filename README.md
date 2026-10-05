@@ -6,9 +6,10 @@
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)(dsh)
 的一个模型供应商来驱动。
 
-与需要 API Key 不同,本适配器把模型调用中继到已登录的网页会话。配套的
-浏览器扩展(`dsh-web` 项目)捕获会话的逐字请求头,并桥接进 dsh 运行时,让
-免费网页订阅成为可用的 harness 模型路由。
+与需要 API Key 不同,本适配器把模型调用中继到已登录的网页会话。插件内置
+网页完成消费者:加载即自动消费 relay ticket 并驱动真实
+chat.deepseek.com 会话,**纯插件部署无需浏览器扩展、无需外部常驻进程**,
+`dsh web` 一条命令即可用,免费网页订阅成为可用的 harness 模型路由。
 
 ## 功能特性
 
@@ -18,10 +19,19 @@
 - 完整的 dsh 生态兼容:以 Cordis bundle patch 形式分发,与官方
   `deepseek-official` / `pi-ai` 路由并列挂载,互不覆盖。
 - **按(dsh 会话, 模式)隔离网页对话链** — 不同 dsh 会话绝不共享
-  chat.deepseek.com 上下文。
+  chat.deepseek.com 上下文(每个 dsh 会话绑定唯一的网页会话,parent 链延续)。
+- **内嵌网页完成消费者**(插件独占模式) — 插件加载即在进程内消费 relay
+  ticket,无需浏览器扩展、无需外部 `relay-consumer` 进程;旧扩展若仍在轮询,
+  用 `disableHttpRelay: true` 让 HTTP 取票口直接回 204,使其抢不到单。
+- **pp 式重试与故意延迟** — 每轮最多 2 次,失败故意等待 10 秒再试(仿
+  deepseek-pp `AUTOMATION_MAX_ATTEMPTS` / `AUTOMATION_RETRY_DELAY_MS`);重试前
+  重读凭据文件并重开网页会话。偶发 40002 只会多等 10 秒,两次都 40002/401
+  才报 `WEB_AUTH_EXPIRED` 并提示重抓登录。
 - **全局请求门控**(仿 pp 防突发):每个 DeepSeek 网页请求至少间隔最小
   时间,避免 agent 运行与并发会话对 chat.deepseek.com 造成请求风暴。
 - 向官方 `dsh-llm-retry` 插件暴露供应商重试策略(429 时上报 `RATE_LIMIT`)。
+- **思考过程同步** — 网页 THINK 片段经 `reasoning` 事件 → `reasoning-delta`
+  组装为 `reasoning` 消息块,官方 UI 原生渲染。
 
 ## 安装
 
@@ -51,11 +61,31 @@ npm install @dsh-web/llm-deepseek-web
 
 ## 使用方法
 
-1. 用 web profile 启动 dsh:`dsh web`
-2. 打开 `http://127.0.0.1:3080`,创建会话,选择
+1. 在任一登录了 chat.deepseek.com 的电脑上抓一次登录凭据(见下节
+   “跨电脑与多账号”),得到凭据文件。
+2. 用 web profile 启动 dsh:`dsh web`
+3. 打开 `http://127.0.0.1:3080`,创建会话,选择
    `deepseek-web` / `deepseek-expert`(或 `deepseek-vision`)。
-3. 网页登录态由配套浏览器扩展提供;生成前需要一个已登录的
-   chat.deepseek.com 标签页。
+4. 发消息即走网页会话真实回复;插件自动消费,无需其他进程。
+
+## 跨电脑与多账号
+
+凭据即文件,自动发现顺序如下(前者优先):
+
+1. 插件配置 `authFile` 显式路径;
+2. 环境变量 `$DSH_WEB_AUTH_FILE`;
+3. **`~/.dsh/web-auth.json`** — 每台电脑/每个账号的标准位置;
+4. 工作区根 `.dsh-auth.json`(开发回退)。
+
+在某台电脑上登录任意账号后运行抓取脚本,即生成该机器该账号的凭据,
+adapter 自动使用,互不干扰:
+
+```bash
+node dsh-web/scripts/capture-web-headers.mjs  # 写入工作区与 ~/.dsh/web-auth.json
+```
+
+凭据有效期为月级;失效时(40002/401)插件报 `WEB_AUTH_EXPIRED` 并提示重抓,
+重试两次后仍失败才会报错,偶发拒绝只会多等 10 秒。
 
 ## 配置项
 
@@ -65,6 +95,10 @@ npm install @dsh-web/llm-deepseek-web
 | `requestDelayMinMs` | `2500` | 生成之间的最小节奏(首个之后) |
 | `requestDelayMaxMs` | `6500` | 生成之间的最大节奏(首个之后) |
 | `retryPolicy` | 常规默认 | 供应商重试策略(由 `dsh-llm-retry` 消费) |
+| `authFile` | 自动发现 | 抓取到的登录凭据文件绝对路径(见上节顺序) |
+| `wasmPath` | 包内优先 | PoW WASM 绝对路径;默认用包内 `wasm/` |
+| `disableEmbeddedConsumer` | `false` | 置 true 则只提供 relay,不内嵌消费(外部消费者模式) |
+| `disableHttpRelay` | `false` | 置 true 则 HTTP 取票口一律回 204(内嵌消费独占,防旧扩展抢单;E2E 保持关闭) |
 
 全局每请求门控(默认 2500 ms)可在运行时通过
 `setDeepSeekRequestMinInterval()` 覆盖。
@@ -81,6 +115,10 @@ Apache-2.0。包含从
 ## English Summary
 
 `@dsh-web/llm-deepseek-web` is a dsh plugin that drives the free
-chat.deepseek.com web session as a model provider. See the Chinese sections
+chat.deepseek.com web session as a model provider. It embeds its own web
+completion consumer, so a plugin-only deployment needs no browser extension:
+per-user login is auto-discovered (`~/.dsh/web-auth.json`), web THINK
+fragments stream as reasoning blocks, and failed turns retry pp-style before
+reporting `WEB_AUTH_EXPIRED`. See the Chinese sections
 above for features, installation, usage, and configuration. Licensed under
 Apache-2.0; see [NOTICE.md](./NOTICE.md) for deepseek-pp attribution.

@@ -68,7 +68,7 @@ export interface RelayHandle {
   close(): Promise<void>;
 }
 
-export function startRelayServer(options: { port: number }): RelayHandle {
+export function startRelayServer(options: { port: number; disableHttpRelay?: boolean }): RelayHandle {
   const sockets = new Set<Socket>();
   let nextId = 1;
   const ticketsById = new Map<number, Ticket>();
@@ -79,11 +79,22 @@ export function startRelayServer(options: { port: number }): RelayHandle {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
 
     if (req.method === 'GET' && url.pathname === '/next') {
+      // Exclusive embedded-consumer mode: never hand tickets to HTTP
+      // pollers (a stale browser extension would otherwise race the
+      // in-process consumer and poison turns with its own errors).
+      if (options.disableHttpRelay === true) {
+        res.writeHead(204).end();
+        return;
+      }
       handleNext(res);
       return;
     }
 
     if (req.method === 'POST' && url.pathname === '/event') {
+      if (options.disableHttpRelay === true) {
+        res.writeHead(204).end();
+        return;
+      }
       const chunks: Buffer[] = [];
       req.on('data', (chunk: Buffer) => chunks.push(chunk));
       req.on('error', () => res.destroy());
@@ -153,6 +164,10 @@ export function startRelayServer(options: { port: number }): RelayHandle {
     if (event.t === 'finish' || event.t === 'error') {
       ticket.queue.close(event.t === 'error' ? new Error(event.message) : undefined);
       ticketsById.delete(id);
+      // With no HTTP pollers draining the queue (exclusive embedded mode),
+      // drop the settled ticket here so queuedTickets cannot grow unbounded.
+      const queuedIndex = queuedTickets.indexOf(ticket);
+      if (queuedIndex >= 0) queuedTickets.splice(queuedIndex, 1);
     }
   }
 

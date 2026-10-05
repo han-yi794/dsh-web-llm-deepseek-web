@@ -23,6 +23,13 @@ export interface Config {
   wasmPath?: string;
   /** Disable the in-process web completion consumer (external relay consumer only). */
   disableEmbeddedConsumer?: boolean;
+  /**
+   * Refuse to hand relay tickets to HTTP pollers. Set when the embedded
+   * consumer owns completions so a stale browser extension cannot race it
+   * and poison turns with its own errors. E2E keeps this off because its
+   * fake-extension poller needs the HTTP endpoints.
+   */
+  disableHttpRelay?: boolean;
 }
 
 export const Config: z<Config> = z.object({
@@ -35,12 +42,13 @@ export const Config: z<Config> = z.object({
   authFile: z.string(),
   wasmPath: z.string(),
   disableEmbeddedConsumer: z.boolean().default(false),
+  disableHttpRelay: z.boolean().default(false),
 });
 
 export function apply(ctx: Context, config: Config): void {
   // The loopback relay lives and dies with the runtime process; the app bin's
   // explicit exits close the listening socket with it.
-  const relay = startRelayServer({ port: config.port });
+  const relay = startRelayServer({ port: config.port, disableHttpRelay: config.disableHttpRelay });
 
   // Plugin-only deployment: consume relay tickets in-process (no browser
   // extension, no external relay-consumer process). Missing auth degrades to
