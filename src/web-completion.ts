@@ -73,6 +73,19 @@ export function attachWebConsumer(relay: RelayHandle, options: WebCompletionOpti
   };
 }
 
+/**
+ * Retry policy mirroring deepseek-pp's automation scheduler
+ * (AUTOMATION_MAX_ATTEMPTS / AUTOMATION_RETRY_DELAY_MS): at most 2 attempts
+ * per turn, with a deliberate delay before the retry so a transient WAF
+ * rejection (e.g. an occasional 40002) is not mistaken for an expired login.
+ */
+const WEB_MAX_ATTEMPTS = 2;
+const WEB_RETRY_DELAY_MS = 10_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function runCompletion(
   ticketId: number,
   prompt: string,
@@ -83,59 +96,71 @@ async function runCompletion(
   log: (line: string) => void,
 ): Promise<void> {
   const emit = (event: RelayEvent): void => relay.deliverEvent(ticketId, event);
-  try {
-    const auth = JSON.parse(readFileSync(authFile, 'utf8')) as { completionHeaders?: Record<string, string> };
-    const headers = { ...(auth.completionHeaders ?? {}) };
-    // Strip stale per-request PoW — dual values confuse the server (MISSING_HEADER).
-    for (const key of Object.keys(headers)) {
-      if (/pow/i.test(key)) delete headers[key];
-    }
+  for (let attempt = 1; attempt <= WEB_MAX_ATTEMPTS; attempt++) {
+    try {
+      // Re-read auth on every attempt so a refreshed file is picked up.
+      const auth = JSON.parse(readFileSync(authFile, 'utf8')) as { completionHeaders?: Record<string, string> };
+      const headers = { ...(auth.completionHeaders ?? {}) };
+      // Strip stale per-request PoW — dual values confuse the server (MISSING_HEADER).
+      for (const key of Object.keys(headers)) {
+        if (/pow/i.test(key)) delete headers[key];
+      }
 
-    if (chain.chatSessionId === null) {
-      chain.chatSessionId = await createChatSession(headers);
-    }
+      if (chain.chatSessionId === null) {
+        chain.chatSessionId = await createChatSession(headers);
+      }
 
-    let wasmBytes: Uint8Array | undefined;
-    if (wasmPath !== '' && existsSync(wasmPath)) {
-      wasmBytes = readFileSync(wasmPath);
-    }
-    const powHeaders = await createPowHeaders(headers, undefined, wasmBytes === undefined ? undefined : { kind: 'bytes', bytes: wasmBytes });
+      let wasmBytes: Uint8Array | undefined;
+      if (wasmPath !== '' && existsSync(wasmPath)) {
+        wasmBytes = readFileSync(wasmPath);
+      }
+      const powHeaders = await createPowHeaders(headers, undefined, wasmBytes === undefined ? undefined : { kind: 'bytes', bytes: wasmBytes });
 
-    const turn = await submitPrompt(
-      {
-        chatSessionId: chain.chatSessionId,
-        parentMessageId: chain.parentMessageId,
-        modelType: 'default',
-        prompt,
-        refFileIds: [],
-        thinkingEnabled: true,
-        searchEnabled: false,
-        clientHeaders: headers,
-        powHeaders,
-      },
-      {
-        onReasoningChunk: (r) => emit({ t: 'reasoning', delta: r }),
-        onTextChunk: (t) => emit({ t: 'text', delta: t }),
-      },
-    );
-    emit({ t: 'finish' });
-    if (turn.responseMessageId !== null && turn.responseMessageId !== undefined) {
-      chain.parentMessageId = turn.responseMessageId;
-    }
-    log(`llm-deepseek-web: turn ok (ticket ${ticketId}, session ${String(chain.chatSessionId).slice(0, 8)}…)`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    // Distinguish expired/invalid login (40002 Missing Token, 401) from
-    // transient faults: the user must re-capture once — never silently retry.
-    if (isAuthFailure(message)) {
-      log(`llm-deepseek-web: WEB LOGIN EXPIRED (ticket ${ticketId}) — ${message.slice(0, 200)}`);
-      log('llm-deepseek-web: re-capture the login: run `node dsh-web/scripts/capture-web-headers.mjs` '
-        + '(or write ~/.dsh/web-auth.json) on any logged-in DeepSeek Web machine, then retry.');
-      emit({ t: 'error', code: 'WEB_AUTH_EXPIRED', message });
+      const turn = await submitPrompt(
+        {
+          chatSessionId: chain.chatSessionId,
+          parentMessageId: chain.parentMessageId,
+          modelType: 'default',
+          prompt,
+          refFileIds: [],
+          thinkingEnabled: true,
+          searchEnabled: false,
+          clientHeaders: headers,
+          powHeaders,
+        },
+        {
+          onReasoningChunk: (r) => emit({ t: 'reasoning', delta: r }),
+          onTextChunk: (t) => emit({ t: 'text', delta: t }),
+        },
+      );
+      emit({ t: 'finish' });
+      if (turn.responseMessageId !== null && turn.responseMessageId !== undefined) {
+        chain.parentMessageId = turn.responseMessageId;
+      }
+      log(`llm-deepseek-web: turn ok (ticket ${ticketId}, session ${String(chain.chatSessionId).slice(0, 8)}…)`);
       return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (attempt < WEB_MAX_ATTEMPTS) {
+        // Deliberate pp-style delay, then a fresh web session for the retry.
+        log(`llm-deepseek-web: attempt ${attempt} failed (ticket ${ticketId}): ${message.slice(0, 160)} — retrying in ${WEB_RETRY_DELAY_MS / 1000}s…`);
+        chain.chatSessionId = null;
+        chain.parentMessageId = null;
+        await sleep(WEB_RETRY_DELAY_MS);
+        continue;
+      }
+      // Distinguish expired/invalid login (40002 Missing Token, 401) from
+      // transient faults: the user must re-capture once — never silently retry.
+      if (isAuthFailure(message)) {
+        log(`llm-deepseek-web: WEB LOGIN EXPIRED (ticket ${ticketId}) — ${message.slice(0, 200)}`);
+        log('llm-deepseek-web: re-capture the login: run `node dsh-web/scripts/capture-web-headers.mjs` '
+          + '(or write ~/.dsh/web-auth.json) on any logged-in DeepSeek Web machine, then retry.');
+        emit({ t: 'error', code: 'WEB_AUTH_EXPIRED', message });
+        return;
+      }
+      log(`llm-deepseek-web: web completion error (ticket ${ticketId}): ${message}`);
+      emit({ t: 'error', code: 'WEB_CONSUMER', message });
     }
-    log(`llm-deepseek-web: web completion error (ticket ${ticketId}): ${message}`);
-    emit({ t: 'error', code: 'WEB_CONSUMER', message });
   }
 }
 
