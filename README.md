@@ -45,6 +45,11 @@ chat.deepseek.com 会话,**纯插件部署无需浏览器扩展、无需外部�
 npm install @dsh-web/llm-deepseek-web
 ```
 
+本包开箱自包含:网页协议层以快照形式收录在 `src/protocol/`
+(源自 `dsh-web` 工作区的 `core/deepseek`,见该目录 `README.md` 的同步规则),
+`node scripts/build.mjs` 把全部相对导入内联进 `dist/index.js`,
+clone 下来即可构建,无需兄弟目录。
+
 在 profile 的 `package.json`(或 `cordis.yml`)中注册 bundle:
 
 ```jsonc

@@ -8,8 +8,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { createChatSession, createPowHeaders, submitPrompt, uploadDeepSeekFile } from '../../core/deepseek/client.ts';
-import { DEEPSEEK_WEB_ROUTES } from '../../core/deepseek/routes.ts';
+import { createChatSession, createPowHeaders, submitPrompt, uploadDeepSeekFile } from './protocol/client.ts';
+import { DEEPSEEK_WEB_ROUTES } from './protocol/routes.ts';
 import type { RelayEvent, RelayImage } from './wire-events.ts';
 import type { RelayHandle } from './relay-server.ts';
 
