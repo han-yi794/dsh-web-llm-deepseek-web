@@ -7,7 +7,9 @@ import type {
   ResolvedRetryPolicy,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm';
+import { readFile } from 'node:fs/promises';
 import type { GenerationTicket } from './relay-server.ts';
+import type { RelayImage } from './wire-events.ts';
 import { createStreamingXmlParser } from './xml-stream-parser.ts';
 
 const TEXT_INDEX = 0;
@@ -42,10 +44,85 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 export interface DeepSeekWebAdapterOptions {
-  enqueue(request: { prompt: string; modelType?: string; dshSessionId?: string }): GenerationTicket;
+  enqueue(request: { prompt: string; modelType?: string; dshSessionId?: string; images?: RelayImage[] }): GenerationTicket;
   /** Random pacing bounds between consecutive web requests (pp release pacing). */
   requestDelayMinMs: number;
   requestDelayMaxMs: number;
+  /** Resolve the harness attachment store (mirrors official adapters). */
+  resolveAttachments?: () => unknown;
+  /** Map a host path to a readable path (mirrors official adapters). */
+  mapHostPath?: (hostPath: string) => string | undefined;
+}
+
+/** Minimal shape of a dsh image content block we resolve to bytes. */
+interface WebImageRef {
+  attachmentId?: string;
+  name?: string;
+  mediaType?: string;
+}
+
+const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+};
+
+function mimeTypeForImage(name: string, fallback?: string): string {
+  if (fallback !== undefined && fallback !== '') return fallback;
+  const lower = name.toLowerCase();
+  for (const [extension, mime] of Object.entries(IMAGE_MIME_BY_EXTENSION)) {
+    if (lower.endsWith(extension)) return mime;
+  }
+  return 'image/png';
+}
+
+/**
+ * Collect attached images from model messages and resolve them to bytes via
+ * the harness attachment store (same seam the official adapters use).
+ * Returns base64 payloads for the relay ticket; the consumer uploads them
+ * and passes the file ids as refFileIds.
+ */
+async function collectTicketImages(
+  messages: readonly Message[],
+  resolveAttachments: (() => unknown) | undefined,
+  mapHostPath: ((hostPath: string) => string | undefined) | undefined,
+): Promise<RelayImage[]> {
+  const images: RelayImage[] = [];
+  if (resolveAttachments === undefined) return images;
+  const attachments = resolveAttachments() as {
+    imageHostPath?: (ref: unknown) => string | undefined;
+  } | null | undefined;
+  if (attachments === null || attachments === undefined || typeof attachments.imageHostPath !== 'function') return images;
+
+  for (const message of messages) {
+    const shaped = message as { content?: unknown };
+    if (!Array.isArray(shaped.content)) continue;
+    for (const block of shaped.content) {
+      if (block === null || typeof block !== 'object') continue;
+      const typed = block as { type?: unknown; attachment?: unknown };
+      if (typed.type !== 'image') continue;
+      const ref = (typed.attachment ?? block) as WebImageRef;
+      let hostPath: string | undefined;
+      try {
+        hostPath = attachments.imageHostPath(ref);
+      } catch {
+        continue;
+      }
+      if (hostPath === undefined) continue;
+      const readonlyPath = mapHostPath !== undefined ? mapHostPath(hostPath) : hostPath;
+      if (readonlyPath === undefined) continue;
+      const bytes = await readFile(readonlyPath);
+      const filename = ref.name ?? String(ref.attachmentId ?? 'image');
+      images.push({
+        dataBase64: bytes.toString('base64'),
+        filename,
+        mimeType: mimeTypeForImage(filename, ref.mediaType),
+      });
+    }
+  }
+  return images;
 }
 
 /**
@@ -67,6 +144,8 @@ export class DeepSeekWebAdapter extends LlmAdapter {
   readonly #requestDelayMinMs: number;
   readonly #requestDelayMaxMs: number;
   readonly #retryPolicy: ResolvedRetryPolicy | undefined;
+  readonly #resolveAttachments: (() => unknown) | undefined;
+  readonly #mapHostPath: ((hostPath: string) => string | undefined) | undefined;
   /** Number of generations started; used to skip pacing before the first. */
   #requestCount = 0;
 
@@ -76,6 +155,8 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     this.#requestDelayMinMs = options.requestDelayMinMs;
     this.#requestDelayMaxMs = options.requestDelayMaxMs;
     this.#retryPolicy = retryPolicy;
+    this.#resolveAttachments = options.resolveAttachments;
+    this.#mapHostPath = options.mapHostPath;
   }
 
   /** Expose the provider retry policy to the official dsh-llm-retry plugin. */
@@ -104,6 +185,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         id: WEB_MODEL_ID,
         name: WEB_MODEL_NAME,
         description: 'DeepSeek 网页会话（内置视觉），免费，经 chat.deepseek.com 登录态。',
+        inputModalities: ['text', 'image'],
       },
     ]);
   }
@@ -129,7 +211,20 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     // Map the selected model id to the deepseek web wire model_type:
     // deepseek-expert → expert, deepseek-vision → vision; other ids → expert.
     const modelType = modelTypeForModel(options.model);
-    const ticket = this.#enqueue({ prompt, modelType, dshSessionId: options.sessionId });
+    // Resolve attached images to bytes first: the consumer uploads them via
+    // /api/v0/file/upload_file and references them as refFileIds (the web
+    // completion never takes inline image bytes).
+    const images = await collectTicketImages(
+      options.messages ?? [],
+      this.#resolveAttachments,
+      this.#mapHostPath,
+    );
+    const ticket = this.#enqueue({
+      prompt,
+      modelType,
+      dshSessionId: options.sessionId,
+      ...(images.length === 0 ? {} : { images }),
+    });
 
     const toolNames = new Set((options.tools ?? []).map(t => t.name));
     const xmlParser = createStreamingXmlParser(toolNames);
@@ -333,6 +428,20 @@ function flattenHistory(messages: readonly Message[]): string {
         .join('');
     }
     if (text) parts.push(`[${role}]: ${text}`);
+    else if (role !== '') {
+      // Non-text blocks (e.g. images) travel as refFileIds; leave a marker
+      // so the prompt references what the model will actually receive.
+      const names: string[] = [];
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block !== null && typeof block === 'object' && (block as {type?:unknown}).type === 'image') {
+            const ref = ((block as {attachment?:unknown}).attachment ?? block) as WebImageRef;
+            names.push(String(ref.name ?? ref.attachmentId ?? 'image'));
+          }
+        }
+      }
+      if (names.length > 0) parts.push(`[${role}]: [attached images: ${names.join(', ')}]`);
+    }
   }
   return parts.join('\n');
 }

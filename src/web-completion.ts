@@ -8,8 +8,9 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { createChatSession, createPowHeaders, submitPrompt } from '../../core/deepseek/client.ts';
-import type { RelayEvent } from './wire-events.ts';
+import { createChatSession, createPowHeaders, submitPrompt, uploadDeepSeekFile } from '../../core/deepseek/client.ts';
+import { DEEPSEEK_WEB_ROUTES } from '../../core/deepseek/routes.ts';
+import type { RelayEvent, RelayImage } from './wire-events.ts';
 import type { RelayHandle } from './relay-server.ts';
 
 const DEFAULT_AUTH_FILE = '.dsh-auth.json';
@@ -63,7 +64,7 @@ export function attachWebConsumer(relay: RelayHandle, options: WebCompletionOpti
   relay.enqueue = (request) => {
     const ticket = originalEnqueue(request);
     const chain = chainFor(request.dshSessionId);
-    void runCompletion(ticket.id, request.prompt, chain, authFile, wasmPath, relay, log);
+    void runCompletion(ticket.id, request.prompt, request.images ?? [], chain, authFile, wasmPath, relay, log);
     return ticket;
   };
 
@@ -89,6 +90,7 @@ function sleep(ms: number): Promise<void> {
 async function runCompletion(
   ticketId: number,
   prompt: string,
+  images: RelayImage[],
   chain: WebChain,
   authFile: string,
   wasmPath: string,
@@ -114,6 +116,23 @@ async function runCompletion(
       if (wasmPath !== '' && existsSync(wasmPath)) {
         wasmBytes = readFileSync(wasmPath);
       }
+      // Upload attached images first (upload-bound PoW, then referenced by id).
+      const refFileIds: string[] = [];
+      for (const image of images) {
+        const uploadPow = await createPowHeaders(
+          headers,
+          DEEPSEEK_WEB_ROUTES.uploadFile,
+          wasmBytes === undefined ? undefined : { kind: 'bytes', bytes: wasmBytes },
+        );
+        const uploaded = await uploadDeepSeekFile({
+          file: new Blob([Buffer.from(image.dataBase64, 'base64')], { type: image.mimeType }),
+          filename: image.filename,
+          modelType: 'default',
+          clientHeaders: headers,
+          powHeaders: uploadPow,
+        });
+        refFileIds.push(uploaded.id);
+      }
       const powHeaders = await createPowHeaders(headers, undefined, wasmBytes === undefined ? undefined : { kind: 'bytes', bytes: wasmBytes });
 
       const turn = await submitPrompt(
@@ -122,7 +141,7 @@ async function runCompletion(
           parentMessageId: chain.parentMessageId,
           modelType: 'default',
           prompt,
-          refFileIds: [],
+          refFileIds,
           thinkingEnabled: true,
           searchEnabled: false,
           clientHeaders: headers,

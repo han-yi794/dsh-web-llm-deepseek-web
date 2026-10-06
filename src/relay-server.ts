@@ -54,6 +54,7 @@ interface Ticket {
   prompt: string;
   modelType?: string;
   dshSessionId?: string;
+  images?: RelayRequest['images'];
   queue: EventQueue;
 }
 
@@ -133,6 +134,7 @@ export function startRelayServer(options: { port: number; disableHttpRelay?: boo
       prompt: ticket.prompt,
       ...ticket.modelType === undefined ? {} : { modelType: ticket.modelType },
       ...ticket.dshSessionId === undefined ? {} : { dshSessionId: ticket.dshSessionId },
+      ...ticket.images === undefined ? {} : { images: ticket.images },
     }));
   }
 
@@ -186,6 +188,7 @@ export function startRelayServer(options: { port: number; disableHttpRelay?: boo
         prompt: request.prompt,
         modelType: request.modelType,
         dshSessionId: request.dshSessionId,
+        images: request.images,
         queue: new EventQueue(),
       };
       ticketsById.set(ticket.id, ticket);

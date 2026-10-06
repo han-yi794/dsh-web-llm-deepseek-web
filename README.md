@@ -32,6 +32,12 @@ chat.deepseek.com 会话,**纯插件部署无需浏览器扩展、无需外部�
 - 向官方 `dsh-llm-retry` 插件暴露供应商重试策略(429 时上报 `RATE_LIMIT`)。
 - **思考过程同步** — 网页 THINK 片段经 `reasoning` 事件 → `reasoning-delta`
   组装为 `reasoning` 消息块,官方 UI 原生渲染。
+- **图片发送(视觉)** — 模型目录声明 `inputModalities: ["text", "image"]`;
+  消息里的图片块经附件存储解析为字节,上传到网页文件接口后以 `refFileIds`
+  引用,网页模型真实"看见"图片内容(已真图验证)。
+- **工具调用双格式容忍** — 标准 `<toolname>{json}</toolname>` 与网页模型偶发的
+  全角 DSML 包裹格式(`<｜｜DSML｜｜ calls>→invoke→parameter`)都会被识别并
+  执行,未知工具名静默丢弃,原文永不泄漏到回答中(含分片跨 chunk 场景)。
 
 ## 安装
 
@@ -67,6 +73,8 @@ npm install @dsh-web/llm-deepseek-web
 3. 打开 `http://127.0.0.1:3080`,创建会话,选择
    `deepseek-web` / `deepseek-expert`(或 `deepseek-vision`)。
 4. 发消息即走网页会话真实回复;插件自动消费,无需其他进程。
+
+直接在输入框点"添加文件"贴图即可,图片自动上传并随本轮一起发给网页模型。
 
 ## 跨电脑与多账号
 
@@ -118,7 +126,9 @@ Apache-2.0。包含从
 chat.deepseek.com web session as a model provider. It embeds its own web
 completion consumer, so a plugin-only deployment needs no browser extension:
 per-user login is auto-discovered (`~/.dsh/web-auth.json`), web THINK
-fragments stream as reasoning blocks, and failed turns retry pp-style before
+fragments stream as reasoning blocks, attached images upload and ride as
+`refFileIds`, both standard and fullwidth-DSML tool-call formats execute
+without leaking, and failed turns retry pp-style before
 reporting `WEB_AUTH_EXPIRED`. See the Chinese sections
 above for features, installation, usage, and configuration. Licensed under
 Apache-2.0; see [NOTICE.md](./NOTICE.md) for deepseek-pp attribution.

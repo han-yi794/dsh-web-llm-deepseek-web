@@ -13,6 +13,22 @@ export interface RelayRequest {
   modelType?: string;
   /** The dsh session that owns this generation — used to isolate web chains. */
   dshSessionId?: string;
+  /**
+   * Attached images for this turn (base64, JSON-safe). The consumer uploads
+   * each via /api/v0/file/upload_file and passes the ids as refFileIds —
+   * the web completion never takes inline image bytes.
+   */
+  images?: RelayImage[];
+}
+
+/** One attached image traveling with a relay ticket. */
+export interface RelayImage {
+  /** Raw bytes, base64-encoded. */
+  dataBase64: string;
+  /** Original filename (falls back to the attachment id). */
+  filename: string;
+  /** MIME type, e.g. image/png. */
+  mimeType: string;
 }
 
 export type RelayEvent =

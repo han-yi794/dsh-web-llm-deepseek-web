@@ -59,13 +59,22 @@ export function apply(ctx: Context, config: Config): void {
       authFile: config.authFile,
       wasmPath: config.wasmPath,
     });
-    ctx.on('dispose', () => detachConsumer?.());
+    ctx.effect(() => () => detachConsumer?.(), 'llm-deepseek-web/consumer');
   }
 
   const options: DeepSeekWebAdapterOptions = {
     enqueue: (request) => relay.enqueue(request),
     requestDelayMinMs: config.requestDelayMinMs,
     requestDelayMaxMs: config.requestDelayMaxMs,
+    // Same seam the official adapters use: resolve attached images to
+    // readable paths per request (mirrors dsh-llm-deepseek wiring).
+    resolveAttachments: () => ctx.get('attachments'),
+    mapHostPath: (hostPath: string) => {
+      const fs = ctx.get('fs') as {
+        processPathFromHostPath?: (hostPath: string) => string | undefined;
+      } | null | undefined;
+      return fs?.processPathFromHostPath?.(hostPath);
+    },
   };
   const resolvedRetry: ResolvedRetryPolicy | undefined = config.retryPolicy === undefined
     ? undefined
