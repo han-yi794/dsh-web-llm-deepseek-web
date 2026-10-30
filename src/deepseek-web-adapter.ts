@@ -8,9 +8,11 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm';
 import { readFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import type { GenerationTicket } from './relay-server.ts';
 import type { RelayImage } from './wire-events.ts';
 import { createStreamingXmlParser } from './xml-stream-parser.ts';
+import type { StreamingXmlParser, ToolRejection, ToolRejectionReason } from './xml-stream-parser.ts';
 
 const TEXT_INDEX = 0;
 const REASONING_INDEX = 1;
@@ -48,6 +50,11 @@ export interface DeepSeekWebAdapterOptions {
   /** Random pacing bounds between consecutive web requests (pp release pacing). */
   requestDelayMinMs: number;
   requestDelayMaxMs: number;
+  /**
+   * Append one automatic correction round when tool-call blocks were rejected
+   * (reasons + the accepted form are fed back to the model). Default true.
+   */
+  toolRetryFeedback?: boolean;
   /** Resolve the harness attachment store (mirrors official adapters). */
   resolveAttachments?: () => unknown;
   /** Map a host path to a readable path (mirrors official adapters). */
@@ -143,6 +150,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
   readonly #enqueue: DeepSeekWebAdapterOptions['enqueue'];
   readonly #requestDelayMinMs: number;
   readonly #requestDelayMaxMs: number;
+  readonly #toolRetryFeedback: boolean;
   readonly #retryPolicy: ResolvedRetryPolicy | undefined;
   readonly #resolveAttachments: (() => unknown) | undefined;
   readonly #mapHostPath: ((hostPath: string) => string | undefined) | undefined;
@@ -154,6 +162,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     this.#enqueue = options.enqueue;
     this.#requestDelayMinMs = options.requestDelayMinMs;
     this.#requestDelayMaxMs = options.requestDelayMaxMs;
+    this.#toolRetryFeedback = options.toolRetryFeedback ?? true;
     this.#retryPolicy = retryPolicy;
     this.#resolveAttachments = options.resolveAttachments;
     this.#mapHostPath = options.mapHostPath;
@@ -193,6 +202,68 @@ export class DeepSeekWebAdapter extends LlmAdapter {
   override async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
     if (options.signal?.aborted) return;
 
+    const toolNames = new Set((options.tools ?? []).map(t => t.name));
+    const hasTools = toolNames.size > 0;
+    // One binding per generation: the instructions embed it, the parser
+    // requires it back from any `<tool>` block that carries an explicit
+    // `_nonce` field. A correction round reuses the SAME binding so the
+    // feedback can restate it verbatim.
+    const toolNonce = hasTools ? randomUUID().replace(/-/g, '') : undefined;
+    const prompt = composeWebPrompt({ ...options, toolNonce });
+    if (prompt === '') {
+      throw new LlmError('deepseek-web requires a non-empty user message', 'EMPTY_PROMPT');
+    }
+
+    // Map the selected model id to the deepseek web wire model_type:
+    // deepseek-expert → expert, deepseek-vision → vision; other ids → expert.
+    const modelType = modelTypeForModel(options.model);
+    // Resolve attached images once: only the first web request carries them
+    // (the consumer uploads them via /api/v0/file/upload_file and references
+    // them as refFileIds; the completion never takes inline image bytes).
+    const images = await collectTicketImages(
+      options.messages ?? [],
+      this.#resolveAttachments,
+      this.#mapHostPath,
+    );
+
+    const toolIndexState = { next: FIRST_TOOL_INDEX };
+    const maxTurns = this.#toolRetryFeedback && hasTools ? 2 : 1;
+
+    let turnPrompt = prompt;
+    let usage: { inputTokens: number; outputTokens: number } | null = null;
+    let rejections: readonly ToolRejection[] = [];
+
+    for (let round = 0; round < maxTurns; round += 1) {
+      const parser = createStreamingXmlParser(toolNames, { nonce: toolNonce });
+      const turn = yield* this.#runWebTurn(
+        turnPrompt, options, modelType, round === 0 ? images : [], parser, toolIndexState,
+      );
+      usage = addUsage(usage, turn.usage);
+      rejections = turn.rejections;
+      if (rejections.length === 0 || round + 1 >= maxTurns) break;
+      // Correction round: tell the model exactly what was rejected, why, and
+      // the only accepted form — then let it retry.
+      turnPrompt = `${prompt}\n\n---\n\n${buildToolRetryFeedback(rejections, toolNames, toolNonce)}`;
+    }
+
+    if (usage !== null) yield { type: 'usage', usage };
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  }
+
+  /**
+   * One web completion round: pace, enqueue, map relay events to StreamChunks
+   * (reasoning flows through; text accumulates and is parsed in phase 2 so
+   * tool blocks are extracted and suppressed), and hand back the round's
+   * usage plus any tool-block rejections for the correction round.
+   */
+  async *#runWebTurn(
+    prompt: string,
+    options: GenerateOptions,
+    modelType: string,
+    images: readonly RelayImage[],
+    xmlParser: StreamingXmlParser,
+    toolIndexState: { next: number },
+  ): AsyncGenerator<StreamChunk, WebTurnOutcome> {
     // Pace every generation after the first (pp release pacing): the web
     // endpoint rate limits bursty traffic, and Throttle here keeps the
     // extension's web calls spaced apart without extra relay machinery.
@@ -203,33 +274,14 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     }
     this.#requestCount += 1;
 
-    const prompt = composeWebPrompt(options);
-    if (prompt === '') {
-      throw new LlmError('deepseek-web requires a non-empty user message', 'EMPTY_PROMPT');
-    }
-
-    // Map the selected model id to the deepseek web wire model_type:
-    // deepseek-expert → expert, deepseek-vision → vision; other ids → expert.
-    const modelType = modelTypeForModel(options.model);
-    // Resolve attached images to bytes first: the consumer uploads them via
-    // /api/v0/file/upload_file and references them as refFileIds (the web
-    // completion never takes inline image bytes).
-    const images = await collectTicketImages(
-      options.messages ?? [],
-      this.#resolveAttachments,
-      this.#mapHostPath,
-    );
     const ticket = this.#enqueue({
       prompt,
       modelType,
       dshSessionId: options.sessionId,
-      ...(images.length === 0 ? {} : { images }),
+      ...(images.length === 0 ? {} : { images: [...images] }),
     });
 
-    const toolNames = new Set((options.tools ?? []).map(t => t.name));
-    const xmlParser = createStreamingXmlParser(toolNames);
     let fullText = '';
-    let nextToolIndex = FIRST_TOOL_INDEX;
     let pendingUsage: { inputTokens: number; outputTokens: number } | null = null;
     let sawFinish = false;
 
@@ -250,18 +302,15 @@ export class DeepSeekWebAdapter extends LlmAdapter {
 
     const queueIterator = ticket[Symbol.asyncIterator]();
 
-    // Stream raw events: reasoning flows through, text passes the streaming
-    // XML parser so tool blocks are extracted in flight and suppressed from
-    // visible deltas.
     try {
       while (!sawFinish) {
-        if (options.signal?.aborted) return;
+        if (options.signal?.aborted) return { usage: pendingUsage, rejections: xmlParser.rejections };
 
         const raced = await Promise.race([
           queueIterator.next().then((result) => ({ kind: 'event' as const, result })),
           abortPromise.then(() => ({ kind: 'aborted' as const })),
         ]);
-        if (raced.kind === 'aborted') return;
+        if (raced.kind === 'aborted') return { usage: pendingUsage, rejections: xmlParser.rejections };
 
         const { done, value: event } = raced.result;
         if (done || event === undefined) break;
@@ -290,16 +339,23 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         if (sawFinish) break;
       }
 
-      // Phase 2: parse accumulated text — extract XML tool calls, emit clean chunks.
-      const parsed = xmlParser.append(fullText);
+      // Phase 2: parse accumulated text — extract XML tool calls, emit clean
+      // chunks. The web UI appends a trailing disclaimer to every reply; strip
+      // it before parsing so it never rides into the last visible delta (or
+      // the tail after a tool envelope) — same suffix strip as OmniRoute.
+      const cleanText = fullText.replace(
+        /\s*This response is AI-generated, for reference only\.\s*$/i,
+        '',
+      );
+      const parsed = xmlParser.append(cleanText);
       const flushed = xmlParser.flush();
 
       for (const text of [...parsed.textDeltas, ...flushed.textDeltas]) {
         if (text) yield { type: 'text-delta', index: TEXT_INDEX, text } as StreamChunk;
       }
       for (const tool of [...parsed.tools, ...flushed.tools]) {
-        const callIndex = nextToolIndex++;
-        const callId = `web_call_${callIndex}`;
+        const callIndex = toolIndexState.next++;
+        const callId = `web_call_\${callIndex}`;
         yield { type: 'block-start', index: callIndex, blockType: 'tool-call' } as StreamChunk;
         yield {
           type: 'tool-call-delta', index: callIndex, id: callId,
@@ -316,10 +372,58 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       }
     }
 
-    if (pendingUsage !== null) yield { type: 'usage', usage: pendingUsage };
     if (!sawFinish) throw new LlmError('relay stream ended before finish', 'RELAY_INCOMPLETE');
-    yield { type: 'finish', reason: { kind: 'stop' } };
+    return { usage: pendingUsage, rejections: xmlParser.rejections };
   }
+}
+
+interface WebTurnOutcome {
+  usage: { inputTokens: number; outputTokens: number } | null;
+  rejections: readonly ToolRejection[];
+}
+
+function addUsage(
+  a: { inputTokens: number; outputTokens: number } | null,
+  b: { inputTokens: number; outputTokens: number } | null,
+): { inputTokens: number; outputTokens: number } | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return { inputTokens: a.inputTokens + b.inputTokens, outputTokens: a.outputTokens + b.outputTokens };
+}
+
+/** Model-facing label for one rejection reason. */
+const REJECTION_LABEL: Record<ToolRejectionReason, string> = {
+  BROKEN_JSON: 'the <tool> block body was not valid JSON',
+  UNKNOWN_TOOL: 'the "name" field did not match any available tool',
+  NONCE_MISMATCH: "the echoed \"_nonce\" did not match this request's binding",
+  UNCLOSED_BLOCK: 'a tool-call block was never closed',
+  OVERSIZE_BLOCK: 'a tool-call block exceeded the size limit without closing',
+};
+
+/**
+ * Build the correction-round prompt appended after the original prompt:
+ * rejected blocks with reasons, then the only accepted form restated
+ * (nonce included) so the model can re-issue a valid call immediately.
+ */
+function buildToolRetryFeedback(
+  rejections: readonly ToolRejection[],
+  toolNames: ReadonlySet<string>,
+  nonce: string | undefined,
+): string {
+  const lines: string[] = [];
+  lines.push('[SYSTEM FEEDBACK — rejected tool call]');
+  lines.push('Your previous reply contained tool-call block(s) that were rejected and NOT executed:');
+  rejections.forEach((rejection, index) => {
+    lines.push(`${index + 1}. ${REJECTION_LABEL[rejection.reason]} — ${rejection.detail}`);
+  });
+  lines.push('');
+  lines.push('The ONLY accepted form (no markdown fence, in the final answer, never inside thinking):');
+  lines.push(`<tool>{"name": "<tool_name>", "arguments": { ... }${nonce ? `, "_nonce": "${nonce}"` : ''}}</tool>`);
+  lines.push('- The body must be ONE valid JSON object: double-quoted keys and strings, no trailing commas, no comments.');
+  lines.push(`- "name" must be exactly one of: ${[...toolNames].join(', ')}.`);
+  if (nonce !== undefined) lines.push(`- "_nonce" must be exactly "${nonce}".`);
+  lines.push('Re-issue the corrected tool-call block now. If no tool call is actually needed, reply normally instead.');
+  return lines.join('\n');
 }
 
 /**
@@ -328,7 +432,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
  * so system prompt, tool instructions, and conversation history must all be
  * folded into one message.
  */
-export function composeWebPrompt(options: GenerateOptions): string {
+export function composeWebPrompt(options: GenerateOptions & { toolNonce?: string }): string {
   const sections: string[] = [];
 
   if (options.system) {
@@ -336,7 +440,7 @@ export function composeWebPrompt(options: GenerateOptions): string {
   }
 
   if (options.tools && options.tools.length > 0) {
-    sections.push(buildToolInstructions(options.tools));
+    sections.push(buildToolInstructions(options.tools, options.toolNonce));
   }
 
   const historyText = flattenHistory(options.messages);
@@ -345,51 +449,71 @@ export function composeWebPrompt(options: GenerateOptions): string {
   return sections.join('\n\n---\n\n');
 }
 
-function buildToolInstructions(tools: NonNullable<GenerateOptions['tools']>): string {
+/**
+ * Per-request tool-invocation binding. Embedded in the tool instructions and
+ * checked inside every parsed `<tool>` block whose JSON body carries an
+ * explicit `_nonce` — a mismatched nonce means the block is hallucinated or
+ * copy-attacked, not a genuine call (mechanism after OmniRoute webTools.ts
+ * #9343, MIT).
+ */
+export function createToolNonce(): string {
+  return randomUUID().replace(/-/g, '');
+}
+
+/**
+ * Serialize the tool catalog into the single canonical `<tool>` envelope
+ * contract. One uniform shape (not per-tool tags) leaves the model fewer
+ * wrapper formats to invent; the `_nonce` binding ties every parsed call to
+ * THIS request so stray JSON from thinking or history is never promoted.
+ */
+function buildToolInstructions(tools: NonNullable<GenerateOptions['tools']>, nonce?: string): string {
   const parts: string[] = [];
 
   parts.push([
     '## Tools',
     '',
-    'You have access to a set of tools. To call a tool, output an XML block with',
-    'the tool name itself as the tag and a JSON object as the body.',
-    '',
-    'The JSON body MUST be valid JSON on its own. Do NOT add any other text inside',
-    'the tags, only JSON. Use forward slashes or escaped backslashes for file paths.',
-    'Only use direct tool-name tags. Never use wrapper formats such as',
-    '<invoke name="tool_name">...</invoke> or <tool_call>...</tool_call>.',
-    'The tag name MUST exactly match one of the available tool names.',
-    'Never place executable tool XML in a thinking/reasoning section; put it in',
-    'the final answer content so it can be executed.',
-    'Do NOT say you cannot call listed tools — they are connected and ready.',
+    'You can call tools. To call a tool, output ONLY this exact block (no markdown fence):',
+    `<tool>{"name": "<tool_name>", "arguments": { ... }${nonce ? `, "_nonce": "${nonce}"` : ''}}</tool>`,
+    'Rules:',
+    '- Use exactly <tool>...</tool>. Do NOT use <tool:name>, <invoke name="...">,',
+    '  <parameter>, id=/name= attributes, fullwidth ｜｜DSML｜｜ markers, or code fences.',
+    '- The body MUST be a single valid JSON object on its own. Use forward slashes or',
+    '  escaped backslashes for file paths.',
+    `- "name" must be one of the tools below; "arguments" must be a JSON object.${nonce ? ` Include the secret binding "_nonce": "${nonce}" exactly as shown.` : ''}`,
+    '- When a tool is needed, emit the <tool> block instead of only describing the plan.',
+    '- Never place a tool block in a thinking/reasoning section; put it in the final',
+    '  answer content so it can be executed.',
+    '- Malformed call blocks (invalid JSON, unknown "name", wrong or missing "_nonce",',
+    '  unclosed) are rejected and a correction round with the reasons will follow.',
+    '- Do NOT say you cannot call listed tools — they are connected and ready.',
   ].join('\n'));
 
   for (const tool of tools) {
-    const params = tool.parameters as Record<string, unknown>;
-    const requiredKeys = Array.isArray(params.required) ? params.required : [];
-    const properties = (params.properties ?? {}) as Record<string, Record<string, unknown>>;
-
-    const examplePayload: Record<string, unknown> = {};
-    for (const key of requiredKeys) {
-      const prop = properties[key];
-      if (!prop) { examplePayload[key] = 'value'; continue; }
-      const type = Array.isArray(prop.type) ? prop.type[0] : prop.type;
-      if (type === 'number' || type === 'integer') examplePayload[key] = 0;
-      else if (type === 'boolean') examplePayload[key] = false;
-      else if (type === 'array') examplePayload[key] = [];
-      else examplePayload[key] = 'value';
+    let schemaText = '';
+    try {
+      const params = tool.parameters as Record<string, unknown> | undefined;
+      if (params && nonce) {
+        // Nonce-bound schema: _nonce becomes a const-required property, so the
+        // model sees the binding as part of the contract it must satisfy.
+        const properties = {
+          ...((params.properties ?? {}) as Record<string, unknown>),
+          _nonce: { type: 'string', const: nonce },
+        };
+        const baseRequired = Array.isArray(params.required)
+          ? params.required.filter((r): r is string => typeof r === 'string')
+          : [];
+        schemaText = JSON.stringify({ ...params, properties, required: [...new Set([...baseRequired, '_nonce'])] });
+      } else if (params) {
+        schemaText = JSON.stringify(params);
+      }
+    } catch {
+      schemaText = '';
     }
 
     parts.push([
       `### Tool ${tool.name}`,
       `Description: ${tool.description}`,
-      '',
-      `Valid call format for ${tool.name}:`,
-      `<${tool.name}>`,
-      JSON.stringify(examplePayload, null, 2),
-      `</${tool.name}>`,
-      `Invalid formats: <invoke name="${tool.name}">...</invoke>, <tool_call>...</tool_call>`,
-      `Parameters JSON Schema: ${JSON.stringify(tool.parameters)}`,
+      schemaText ? `Parameters JSON Schema: ${schemaText}` : '(no parameters)',
     ].join('\n'));
   }
 
@@ -397,12 +521,12 @@ function buildToolInstructions(tools: NonNullable<GenerateOptions['tools']>): st
   const names = tools.map(t => t.name).join(', ');
   parts.push([
     '---',
-    `工具调用格式提醒：`,
-    `可用工具标签名：${names}`,
-    '这些工具已由扩展连接，可以执行。不要声称自己无法调用列表中的工具。',
-    '调用工具时，只能使用与工具名一致的直接 XML 标签，并把合法 JSON 放在标签体内。',
-    '不要使用 <invoke name="...">、<tool_call> 或任何包装格式。',
-    '不要把可执行工具 XML 放在思考/reasoning 区域；必须放在最终回答正文中。',
+    '工具调用格式提醒：',
+    `可用工具名：${names}`,
+    '这些工具已连接，可以执行。不要声称自己无法调用列表中的工具。',
+    '调用工具时，只能使用 <tool>{"name": ..., "arguments": ...}</tool> 这一种格式，',
+    '不要使用 <invoke name="...">、全角｜｜DSML｜｜标记、<工具名> 标签或任何包装格式。',
+    '不要把工具调用放在思考/reasoning 区域；必须放在最终回答正文中。',
   ].join('\n'));
 
   return parts.join('\n\n');

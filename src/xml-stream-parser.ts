@@ -27,6 +27,26 @@ export interface StreamParseResult {
   tools: CompletedToolCall[];
 }
 
+/** Why one tool-call block was rejected instead of executed. */
+export type ToolRejectionReason =
+  | 'BROKEN_JSON'
+  | 'UNKNOWN_TOOL'
+  | 'NONCE_MISMATCH'
+  | 'UNCLOSED_BLOCK'
+  | 'OVERSIZE_BLOCK';
+
+export interface ToolRejection {
+  reason: ToolRejectionReason;
+  /** Human/model-readable specifics (truncated raw fragment, offending name…). */
+  detail: string;
+}
+
+/** Truncate a raw fragment for rejection details — bounded, never the whole body. */
+function rejectionSnippet(raw: string, max = 200): string {
+  const flat = raw.replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+}
+
 const MAX_TOOL_BODY_CHARS = 1_048_576;
 
 /**
@@ -41,19 +61,56 @@ const MAX_TOOL_BODY_CHARS = 1_048_576;
  */
 const DSML_OPEN_FULL = '<｜｜DSML｜｜ calls>';
 const DSML_CLOSE_FULL = '</｜｜DSML｜｜ calls>';
+const DSML_INVOKE_OPEN_PREFIX = '<｜｜DSML｜｜ invoke';
+const DSML_INVOKE_CLOSE_FULL = '</｜｜DSML｜｜ invoke>';
 const DSML_CALLS_OPEN_RE = /<｜｜DSML｜｜\s*calls\s*>/;
 const DSML_CALLS_CLOSE_RE = /<\/｜｜DSML｜｜\s*calls\s*>/;
+// Observed drift: the model sometimes drops the `calls` wrapper and emits a
+// bare invoke block. Accept an invoke opener as a DSML entry point too; its
+// terminal marker is the invoke closer, not the calls closer.
+const DSML_INVOKE_OPEN_RE = /<｜｜DSML｜｜\s*invoke\b[^>]*>/;
+const DSML_INVOKE_NAME_RE = /<｜｜DSML｜｜\s*invoke\s+name="([^"]*)"/;
+const DSML_INVOKE_CLOSE_RE = /<\/｜｜DSML｜｜\s*invoke\s*>/;
+const DSML_ANY_OPEN_RE = /<｜｜DSML｜｜\s*(?:calls|invoke)\b[^>]*>/;
 const DSML_INVOKE_RE = /<｜｜DSML｜｜\s*invoke\s+name="([^"]*)"\s*>([\s\S]*?)<\/｜｜DSML｜｜\s*invoke\s*>/g;
 const DSML_PARAM_RE = /<｜｜DSML｜｜\s*parameter\s+name="([^"]*)"(?:\s+string="[^"]*")?\s*>([\s\S]*?)<\/｜｜DSML｜｜\s*parameter\s*>/g;
 /** Longest marker: a split marker is always fully inside the held tail. */
-const DSML_TAIL_BOUND = DSML_CLOSE_FULL.length;
+const DSML_TAIL_BOUND = DSML_INVOKE_CLOSE_FULL.length;
+
+// Canonical `<tool>{json}</tool>` envelope — the shape the tool instructions
+// now mandate; everything else (legacy tags, DSML) stays as tolerance paths.
+type EnvelopeBody = { name?: unknown; arguments?: unknown; _nonce?: unknown };
+const TOOL_ENVELOPE_OPEN = '<tool>';
+const TOOL_ENVELOPE_OPEN_RE = /<tool\s*>/;
+const TOOL_ENVELOPE_CLOSE_RE = /<\/tool\s*>/;
+
+function envelopeTailLength(text: string): number {
+  const candidates = [TOOL_ENVELOPE_OPEN, '</tool>'];
+  const limit = Math.min(text.length, Math.max(...candidates.map((c) => c.length)));
+  for (let length = limit; length > 0; length -= 1) {
+    const tail = text.slice(-length);
+    if (candidates.some((c) => c.startsWith(tail))) return length;
+  }
+  return 0;
+}
 
 /** How many trailing chars to hold back for a possibly-split DSML marker. */
 function dsmlTailLength(text: string): number {
+  // A marker may be split mid-attributes (invoke openers carry name="…"):
+  // hold from the last marker prefix until a '>' completes it — flush emits
+  // the held span if it never becomes a marker, so nothing is lost.
+  const lastPrefix = text.lastIndexOf('<｜｜DSML｜｜');
+  if (lastPrefix >= 0) {
+    const rest = text.slice(lastPrefix);
+    if (!rest.includes('>')) return rest.length;
+  }
   const limit = Math.min(text.length, DSML_TAIL_BOUND);
   for (let length = limit; length > 0; length -= 1) {
     const tail = text.slice(-length);
-    if (DSML_OPEN_FULL.startsWith(tail) || DSML_CLOSE_FULL.startsWith(tail)) return length;
+    if (DSML_OPEN_FULL.startsWith(tail) || DSML_CLOSE_FULL.startsWith(tail)
+      || DSML_INVOKE_OPEN_PREFIX.startsWith(tail) || DSML_INVOKE_CLOSE_FULL.startsWith(tail)) {
+      return length;
+    }
   }
   return 0;
 }
@@ -70,37 +127,86 @@ function completeDsmlCalls(
     const name = invoke[1] ?? '';
     if (name === '' || !toolNames.has(name)) continue;
     const invokeBody = invoke[2] ?? '';
-    const args: Record<string, string> = {};
-    DSML_PARAM_RE.lastIndex = 0;
-    let param: RegExpExecArray | null;
-    while ((param = DSML_PARAM_RE.exec(invokeBody)) !== null) {
-      const key = param[1] ?? '';
-      const value = param[2] ?? '';
-      if (key !== '') args[key] = value.trim();
-    }
-    result.tools.push({ name, argsJson: JSON.stringify(args) });
+    const argsJson = parseDsmlParameterValues(invokeBody);
+    result.tools.push({ name, argsJson });
   }
+}
+
+/**
+ * Extract parameter name/value pairs from one DSML invoke body.
+ *
+ * Segment-scan instead of one non-greedy regex: the model occasionally
+ * mis-styles the NEXT parameter's opening tag as a closing tag
+ * (`</｜｜DSML｜｜ parameter name="command" ...>`), which makes a
+ * non-greedy "open…close" match swallow the whole remainder into the
+ * previous value. Segmenting on every `parameter name="…"` marker (opening
+ * OR mis-styled closing) keeps each value bounded by the next marker.
+ */
+function parseDsmlParameterValues(invokeBody: string): string {
+  // Normalize mis-styled closers into marker form so the segment scan sees
+  // them; plain closers (no name attribute) are unaffected.
+  const normalized = invokeBody.replace(/<\s*\/｜｜DSML｜｜\s*parameter\s+name="/g, '<｜｜DSML｜｜ parameter name="');
+  if (process.env.DSH_DSML_DEBUG) process.stderr.write(`[dsml-dbg] normalized=${JSON.stringify(normalized)}\n`);
+  const MARKER = /<｜｜DSML｜｜\s*parameter\s+name="([^"]*)"[^>]*>/g;
+  type Marker = { key: string; markerStart: number; valueStart: number };
+  const markers: Marker[] = [];
+  let m: RegExpExecArray | null;
+  MARKER.lastIndex = 0;
+  while ((m = MARKER.exec(normalized)) !== null) {
+    markers.push({ key: m[1] ?? '', markerStart: m.index, valueStart: m.index + m[0].length });
+  }
+  const args: Record<string, string> = {};
+  for (let i = 0; i < markers.length; i++) {
+    const key = markers[i]!.key;
+    if (key === '') continue;
+    // Each value runs to the next parameter marker (opening OR mis-styled
+    // closing, both normalized above); the last runs to the end of the body.
+    const rawEnd = i + 1 < markers.length ? markers[i + 1]!.markerStart : normalized.length;
+    let value = normalized.slice(markers[i]!.valueStart, rawEnd);
+    // A well-formed body still carries the plain closing tag at the tail of
+    // each value segment — strip exactly that trailing closer.
+    value = value.replace(/<\/｜｜DSML｜｜\s*parameter[^>]*>\s*$/, '').trim();
+    args[key] = value;
+  }
+  return JSON.stringify(args);
 }
 
 export interface StreamingXmlParser {
   append(chunk: string): StreamParseResult;
   flush(): StreamParseResult;
+  /** Tool-call blocks rejected so far (dropped without executing, never leaked). */
+  readonly rejections: readonly ToolRejection[];
 }
 
-export function createStreamingXmlParser(toolNames: ReadonlySet<string>): StreamingXmlParser {
-  return new XmlStreamingParser(toolNames);
+export function createStreamingXmlParser(
+  toolNames: ReadonlySet<string>,
+  options: { nonce?: string } = {},
+): StreamingXmlParser {
+  return new XmlStreamingParser(toolNames, options);
 }
 
 class XmlStreamingParser implements StreamingXmlParser {
   private readonly names: ReadonlySet<string>;
-  private state: 'NORMAL' | 'SUPPRESSING' | 'SUPPRESSING_DSML' = 'NORMAL';
+  private readonly nonce: string | undefined;
+  private readonly rejected: ToolRejection[] = [];
+  private state: 'NORMAL' | 'SUPPRESSING' | 'SUPPRESSING_DSML' | 'SUPPRESSING_ENVELOPE' = 'NORMAL';
   private pendingText = '';
   private pendingBody = '';
   private pendingDsmlBody = '';
+  private pendingEnvelopeBody = '';
+  // Bare-invoke DSML mode: set when the matched DSML opener is an invoke
+  // (no `calls` wrapper) — the terminal marker and body shape differ.
+  private dsmlCloseIsInvoke = false;
+  private dsmlInvokeName: string | null = null;
   private currentName: string | null = null;
 
-  constructor(toolNames: ReadonlySet<string>) {
+  constructor(toolNames: ReadonlySet<string>, options: { nonce?: string } = {}) {
     this.names = toolNames;
+    this.nonce = options.nonce;
+  }
+
+  get rejections(): readonly ToolRejection[] {
+    return this.rejected;
   }
 
   append(chunk: string): StreamParseResult {
@@ -116,7 +222,9 @@ class XmlStreamingParser implements StreamingXmlParser {
         ? this.consumeSuppressed(remaining, result)
         : this.state === 'SUPPRESSING_DSML'
           ? this.consumeDsml(remaining, result)
-          : this.consumeNormal(remaining, result);
+          : this.state === 'SUPPRESSING_ENVELOPE'
+            ? this.consumeEnvelope(remaining, result)
+            : this.consumeNormal(remaining, result);
     }
     return result;
   }
@@ -130,9 +238,28 @@ class XmlStreamingParser implements StreamingXmlParser {
     }
     // An unterminated tool block at EOF: the XML is not executed, and its raw
     // body must not surface (C3). Drop it as a unit.
+    if (this.state === 'SUPPRESSING_ENVELOPE') {
+      this.rejected.push({
+        reason: 'UNCLOSED_BLOCK',
+        detail: `A <tool> block was never closed with </tool> before the reply ended; started with: ${rejectionSnippet(this.pendingEnvelopeBody)}`,
+      });
+    } else if (this.state === 'SUPPRESSING') {
+      this.rejected.push({
+        reason: 'UNCLOSED_BLOCK',
+        detail: `A <${this.currentName ?? 'tool'}> block was never closed before the reply ended; started with: ${rejectionSnippet(this.pendingBody)}`,
+      });
+    } else if (this.state === 'SUPPRESSING_DSML') {
+      this.rejected.push({
+        reason: 'UNCLOSED_BLOCK',
+        detail: `A DSML ${this.dsmlCloseIsInvoke ? 'invoke' : 'calls'} block was never closed before the reply ended; started with: ${rejectionSnippet(this.pendingDsmlBody)}`,
+      });
+    }
     this.state = 'NORMAL';
     this.pendingBody = '';
     this.pendingDsmlBody = '';
+    this.pendingEnvelopeBody = '';
+    this.dsmlCloseIsInvoke = false;
+    this.dsmlInvokeName = null;
     this.currentName = null;
     return result;
   }
@@ -141,15 +268,41 @@ class XmlStreamingParser implements StreamingXmlParser {
     const text = this.pendingText + input;
     this.pendingText = '';
 
-    // A DSML envelope wins when its opener precedes any standard tool tag.
-    const dsml = DSML_CALLS_OPEN_RE.exec(text);
-    const dsmlIndex: number | undefined = dsml?.index;
+    // Earliest opener wins across the three dialects: the canonical
+    // `<tool>{json}</tool>` envelope, the legacy fullwidth DSML envelope, and
+    // per-tool XML tags. Ranking by position (not by check order) keeps a
+    // legacy opener that precedes a `<tool>` block from leaking as text.
+    const envelope = TOOL_ENVELOPE_OPEN_RE.exec(text);
+    const dsml = DSML_ANY_OPEN_RE.exec(text);
     const found = findFirstXmlToolTag(text, this.names, { closing: false });
-    if (dsml !== null && dsmlIndex !== undefined && (!found || dsmlIndex < found.index)) {
+    const envelopeIndex: number | undefined = envelope?.index;
+    const dsmlIndex: number | undefined = dsml?.index;
+    const earliest = Math.min(
+      envelopeIndex ?? Number.POSITIVE_INFINITY,
+      dsmlIndex ?? Number.POSITIVE_INFINITY,
+      found?.index ?? Number.POSITIVE_INFINITY,
+    );
+
+    if (envelopeIndex !== undefined && envelopeIndex === earliest) {
+      const opener = envelope?.[0] ?? '';
+      const before = text.slice(0, envelopeIndex);
+      if (before.length > 0) result.textDeltas.push(before);
+      this.state = 'SUPPRESSING_ENVELOPE';
+      this.pendingEnvelopeBody = '';
+      return text.slice(envelopeIndex + opener.length);
+    }
+
+    if (dsml !== null && dsmlIndex !== undefined && dsmlIndex === earliest) {
       const opener = dsml[0] ?? '';
       const before = text.slice(0, dsmlIndex);
       if (before.length > 0) result.textDeltas.push(before);
       this.state = 'SUPPRESSING_DSML';
+      // A bare invoke opener closes with the invoke marker and carries the
+      // tool name on the opener (already consumed), so record both.
+      this.dsmlCloseIsInvoke = DSML_INVOKE_OPEN_RE.test(opener);
+      this.dsmlInvokeName = this.dsmlCloseIsInvoke
+        ? (DSML_INVOKE_NAME_RE.exec(opener)?.[1] ?? null)
+        : null;
       this.pendingDsmlBody = '';
       return text.slice(dsmlIndex + opener.length);
     }
@@ -158,6 +311,7 @@ class XmlStreamingParser implements StreamingXmlParser {
       const tail = Math.max(
         getPartialXmlToolTagTailLength(text, this.names, { closing: false }),
         dsmlTailLength(text),
+        envelopeTailLength(text),
       );
       const emitLength = text.length - tail;
       if (emitLength > 0) result.textDeltas.push(text.slice(0, emitLength));
@@ -173,6 +327,91 @@ class XmlStreamingParser implements StreamingXmlParser {
     this.pendingBody = '';
     this.currentName = found.name;
     return text.slice(found.endIndex);
+  }
+
+  /**
+   * Collect the canonical `<tool>{json}</tool>` envelope body. The body is a
+   * single JSON object (`name`, `arguments`, optional `_nonce`); a mismatched
+   * explicit `_nonce` marks the block as hallucinated or copy-attacked, so it
+   * is dropped without executing. A parse failure also drops the block — its
+   * raw JSON must never surface as visible text (pitfall C3).
+   */
+  private consumeEnvelope(input: string, result: StreamParseResult): string {
+    const text = this.pendingEnvelopeBody + input;
+    this.pendingEnvelopeBody = '';
+
+    const close = TOOL_ENVELOPE_CLOSE_RE.exec(text);
+    if (!close || close.index === undefined) {
+      this.pendingEnvelopeBody = text;
+      if (this.pendingEnvelopeBody.length > MAX_TOOL_BODY_CHARS) {
+        this.state = 'NORMAL';
+        this.pendingEnvelopeBody = '';
+        // Drop the runaway body outright: re-emitting any of it would leak raw
+        // envelope JSON as visible text (pitfall C3), and a held partial
+        // closer is useless once the block is abandoned.
+        this.rejected.push({
+          reason: 'OVERSIZE_BLOCK',
+          detail: `The <tool> block exceeded ${MAX_TOOL_BODY_CHARS} chars without a closing </tool>; started with: ${rejectionSnippet(text)}`,
+        });
+        return '';
+      }
+      return '';
+    }
+
+    // At least one closer is present: use the one whose body parses as JSON.
+    // A literal `</tool>` inside a string value makes the first candidate cut
+    // mid-JSON; the real closer comes later. Genuinely broken JSON still drops
+    // (remainder after the FIRST closer flows — surrounding prose survives).
+    const closeRe = new RegExp(TOOL_ENVELOPE_CLOSE_RE.source, 'g');
+    let closeIndex = -1;
+    let closeLength = 0;
+    let parsed: EnvelopeBody | null = null;
+    let m: RegExpExecArray | null;
+    while ((m = closeRe.exec(text)) !== null) {
+      try {
+        parsed = JSON.parse(text.slice(0, m.index).trim()) as EnvelopeBody;
+        closeIndex = m.index;
+        closeLength = m[0]?.length ?? 0;
+        break;
+      } catch {
+        // embedded closer inside a string value — try the next one
+      }
+    }
+
+    this.state = 'NORMAL';
+    this.pendingEnvelopeBody = '';
+
+    if (closeIndex < 0 || parsed === null) {
+      this.rejected.push({
+        reason: 'BROKEN_JSON',
+        detail: `The <tool> block body was not valid JSON (a literal "</tool>" inside a string value also triggers this). Body: ${rejectionSnippet(text.slice(0, close.index))}`,
+      });
+      const idx = close.index;
+      return text.slice(idx + (close[0]?.length ?? 0)); // broken JSON: drop, never leak
+    }
+    const remainder = text.slice(closeIndex + closeLength);
+
+    const name = typeof parsed.name === 'string' ? parsed.name : '';
+    if (name === '' || !this.names.has(name)) {
+      this.rejected.push({
+        reason: 'UNKNOWN_TOOL',
+        detail: `The "name" field was "${rejectionSnippet(name)}", which is not one of the available tools: ${[...this.names].join(', ')}.`,
+      });
+      return remainder;
+    }
+    // Nonce binding: only enforced when the model echoed a _nonce field back
+    // (backward compatible with bodies produced before the binding existed).
+    if (typeof parsed._nonce === 'string' && this.nonce !== undefined && parsed._nonce !== this.nonce) {
+      this.rejected.push({
+        reason: 'NONCE_MISMATCH',
+        detail: `The echoed "_nonce" ("${rejectionSnippet(parsed._nonce, 64)}") did not match this request's binding.`,
+      });
+      return remainder;
+    }
+    const args = parsed.arguments === undefined ? {} : parsed.arguments;
+    const argsJson = typeof args === 'string' ? args : JSON.stringify(args ?? {});
+    result.tools.push({ name, argsJson });
+    return remainder;
   }
 
   private consumeSuppressed(input: string, result: StreamParseResult): string {
@@ -193,6 +432,10 @@ class XmlStreamingParser implements StreamingXmlParser {
       // Oversize guard: stop buffering a runaway tool body.
       if (this.pendingBody.length > MAX_TOOL_BODY_CHARS) {
         const tail = getPartialXmlToolTagTailLength(text, new Set([this.currentName]), { closing: true });
+        this.rejected.push({
+          reason: 'OVERSIZE_BLOCK',
+          detail: `A <${this.currentName}> block exceeded ${MAX_TOOL_BODY_CHARS} chars without closing; started with: ${rejectionSnippet(text)}`,
+        });
         this.abortCurrentTool();
         return text.slice(-tail);
       }
@@ -210,7 +453,8 @@ class XmlStreamingParser implements StreamingXmlParser {
     const text = this.pendingDsmlBody + input;
     this.pendingDsmlBody = '';
 
-    const close = DSML_CALLS_CLOSE_RE.exec(text);
+    const closeRe = this.dsmlCloseIsInvoke ? DSML_INVOKE_CLOSE_RE : DSML_CALLS_CLOSE_RE;
+    const close = closeRe.exec(text);
     if (!close || close.index === undefined) {
       // Keep the WHOLE buffer (see consumeSuppressed): a split closer
       // completes in a later chunk; dropping the tail would lose it.
@@ -219,13 +463,28 @@ class XmlStreamingParser implements StreamingXmlParser {
       if (this.pendingDsmlBody.length > MAX_TOOL_BODY_CHARS) {
         this.state = 'NORMAL';
         this.pendingDsmlBody = '';
+        this.rejected.push({
+          reason: 'OVERSIZE_BLOCK',
+          detail: `A DSML ${this.dsmlCloseIsInvoke ? 'invoke' : 'calls'} block exceeded ${MAX_TOOL_BODY_CHARS} chars without closing; started with: ${rejectionSnippet(text)}`,
+        });
         return text.slice(-dsmlTailLength(text));
       }
       return '';
     }
 
     const body = text.slice(0, close.index);
-    completeDsmlCalls(body, this.names, result);
+    if (this.dsmlCloseIsInvoke) {
+      // Bare invoke (no `calls` wrapper): opener and closer were consumed
+      // around the interior, so parse the parameter segment directly.
+      const name = this.dsmlInvokeName ?? '';
+      if (name !== '' && this.names.has(name)) {
+        result.tools.push({ name, argsJson: parseDsmlParameterValues(body) });
+      }
+    } else {
+      completeDsmlCalls(body, this.names, result);
+    }
+    this.dsmlCloseIsInvoke = false;
+    this.dsmlInvokeName = null;
     this.state = 'NORMAL';
     this.pendingDsmlBody = '';
     const closeText = close[0] ?? '';
