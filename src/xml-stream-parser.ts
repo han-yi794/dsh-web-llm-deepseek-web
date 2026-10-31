@@ -63,19 +63,24 @@ const DSML_OPEN_FULL = '<｜｜DSML｜｜ calls>';
 const DSML_CLOSE_FULL = '</｜｜DSML｜｜ calls>';
 const DSML_INVOKE_OPEN_PREFIX = '<｜｜DSML｜｜ invoke';
 const DSML_INVOKE_CLOSE_FULL = '</｜｜DSML｜｜ invoke>';
+// Observed drift: the model also emits a `tool_calls`-suffixed envelope
+// (`<｜｜DSML｜｜tool_calls>` with no space, real production sample) whose
+// meaning is identical to the plain `calls` envelope.
+const DSML_TOOLCALLS_OPEN_FULL = '<｜｜DSML｜｜tool_calls>';
+const DSML_TOOLCALLS_CLOSE_FULL = '</｜｜DSML｜｜tool_calls>';
 const DSML_CALLS_OPEN_RE = /<｜｜DSML｜｜\s*calls\s*>/;
-const DSML_CALLS_CLOSE_RE = /<\/｜｜DSML｜｜\s*calls\s*>/;
+const DSML_CALLS_CLOSE_RE = /<\/｜｜DSML｜｜\s*(?:tool_)?calls\s*>/;
 // Observed drift: the model sometimes drops the `calls` wrapper and emits a
 // bare invoke block. Accept an invoke opener as a DSML entry point too; its
 // terminal marker is the invoke closer, not the calls closer.
 const DSML_INVOKE_OPEN_RE = /<｜｜DSML｜｜\s*invoke\b[^>]*>/;
 const DSML_INVOKE_NAME_RE = /<｜｜DSML｜｜\s*invoke\s+name="([^"]*)"/;
 const DSML_INVOKE_CLOSE_RE = /<\/｜｜DSML｜｜\s*invoke\s*>/;
-const DSML_ANY_OPEN_RE = /<｜｜DSML｜｜\s*(?:calls|invoke)\b[^>]*>/;
+const DSML_ANY_OPEN_RE = /<｜｜DSML｜｜\s*(?:tool_)?calls\b[^>]*>|<｜｜DSML｜｜\s*invoke\b[^>]*>/;
 const DSML_INVOKE_RE = /<｜｜DSML｜｜\s*invoke\s+name="([^"]*)"\s*>([\s\S]*?)<\/｜｜DSML｜｜\s*invoke\s*>/g;
 const DSML_PARAM_RE = /<｜｜DSML｜｜\s*parameter\s+name="([^"]*)"(?:\s+string="[^"]*")?\s*>([\s\S]*?)<\/｜｜DSML｜｜\s*parameter\s*>/g;
 /** Longest marker: a split marker is always fully inside the held tail. */
-const DSML_TAIL_BOUND = DSML_INVOKE_CLOSE_FULL.length;
+const DSML_TAIL_BOUND = DSML_TOOLCALLS_CLOSE_FULL.length;
 
 // Canonical `<tool>{json}</tool>` envelope — the shape the tool instructions
 // now mandate; everything else (legacy tags, DSML) stays as tolerance paths.
@@ -108,7 +113,8 @@ function dsmlTailLength(text: string): number {
   for (let length = limit; length > 0; length -= 1) {
     const tail = text.slice(-length);
     if (DSML_OPEN_FULL.startsWith(tail) || DSML_CLOSE_FULL.startsWith(tail)
-      || DSML_INVOKE_OPEN_PREFIX.startsWith(tail) || DSML_INVOKE_CLOSE_FULL.startsWith(tail)) {
+      || DSML_INVOKE_OPEN_PREFIX.startsWith(tail) || DSML_INVOKE_CLOSE_FULL.startsWith(tail)
+      || DSML_TOOLCALLS_OPEN_FULL.startsWith(tail) || DSML_TOOLCALLS_CLOSE_FULL.startsWith(tail)) {
       return length;
     }
   }
