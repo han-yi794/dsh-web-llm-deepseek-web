@@ -1,9 +1,9 @@
 import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm';
 import type {
+  BuiltinLlmFailureCode,
   GenerateOptions,
   LlmModelInfo,
   LlmProviderInfo,
-  Message,
   ResolvedRetryPolicy,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm';
@@ -92,7 +92,7 @@ function mimeTypeForImage(name: string, fallback?: string): string {
  * and passes the file ids as refFileIds.
  */
 async function collectTicketImages(
-  messages: readonly Message[],
+  messages: GenerateOptions['messages'],
   resolveAttachments: (() => unknown) | undefined,
   mapHostPath: ((hostPath: string) => string | undefined) | undefined,
 ): Promise<RelayImage[]> {
@@ -211,7 +211,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     const toolNonce = hasTools ? randomUUID().replace(/-/g, '') : undefined;
     const prompt = composeWebPrompt({ ...options, toolNonce });
     if (prompt === '') {
-      throw new LlmError('deepseek-web requires a non-empty user message', 'EMPTY_PROMPT');
+      throw new LlmError('deepseek-web requires a non-empty user message', 'INVALID_REQUEST');
     }
 
     // Map the selected model id to the deepseek web wire model_type:
@@ -232,6 +232,9 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     let turnPrompt = prompt;
     let usage: { inputTokens: number; outputTokens: number } | null = null;
     let rejections: readonly ToolRejection[] = [];
+    let textChars = 0;
+    let toolCount = 0;
+    let reasoningChars = 0;
 
     for (let round = 0; round < maxTurns; round += 1) {
       const parser = createStreamingXmlParser(toolNames, { nonce: toolNonce });
@@ -240,10 +243,24 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       );
       usage = addUsage(usage, turn.usage);
       rejections = turn.rejections;
+      textChars += turn.textChars;
+      toolCount += turn.toolCount;
+      reasoningChars += turn.reasoningChars;
       if (rejections.length === 0 || round + 1 >= maxTurns) break;
       // Correction round: tell the model exactly what was rejected, why, and
       // the only accepted form — then let it retry.
       turnPrompt = `${prompt}\n\n---\n\n${buildToolRetryFeedback(rejections, toolNames, toolNonce)}`;
+    }
+
+    // A completed generation with zero reasoning, text, and tool blocks is a
+    // degenerate web completion (observed on oversized prompts); classify it
+    // as EMPTY_RESPONSE instead of yielding a silent empty message — the
+    // official providers do the same and the retry plugin retries on it.
+    if (textChars === 0 && toolCount === 0 && reasoningChars === 0) {
+      throw new LlmError(
+        'deepseek-web returned a completed response with no content',
+        'EMPTY_RESPONSE',
+      );
     }
 
     if (usage !== null) yield { type: 'usage', usage };
@@ -284,6 +301,10 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     let fullText = '';
     let pendingUsage: { inputTokens: number; outputTokens: number } | null = null;
     let sawFinish = false;
+    // Output accounting feeds the EMPTY_RESPONSE classification: a completed
+    // web turn that produced no reasoning, text, or tool blocks is degenerate.
+    let reasoningChars = 0;
+    let toolCount = 0;
 
     // Cancellation must interrupt a PARKED wait too, so the queue iterator is
     // raced against the caller's abort signal instead of using plain for-await.
@@ -304,19 +325,24 @@ export class DeepSeekWebAdapter extends LlmAdapter {
 
     try {
       while (!sawFinish) {
-        if (options.signal?.aborted) return { usage: pendingUsage, rejections: xmlParser.rejections };
+        if (options.signal?.aborted) {
+          return { usage: pendingUsage, rejections: xmlParser.rejections, textChars: fullText.length, toolCount, reasoningChars };
+        }
 
         const raced = await Promise.race([
           queueIterator.next().then((result) => ({ kind: 'event' as const, result })),
           abortPromise.then(() => ({ kind: 'aborted' as const })),
         ]);
-        if (raced.kind === 'aborted') return { usage: pendingUsage, rejections: xmlParser.rejections };
+        if (raced.kind === 'aborted') {
+          return { usage: pendingUsage, rejections: xmlParser.rejections, textChars: fullText.length, toolCount, reasoningChars };
+        }
 
         const { done, value: event } = raced.result;
         if (done || event === undefined) break;
 
         switch (event.t) {
           case 'reasoning':
+            reasoningChars += event.delta.length;
             yield { type: 'reasoning-delta', index: REASONING_INDEX, text: event.delta };
             break;
           case 'text':
@@ -332,7 +358,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
             sawFinish = true;
             break;
           case 'error':
-            throw new LlmError(event.message, event.code);
+            throw new LlmError(event.message, toLlmFailureCode(event.code));
         }
         // finish terminates the stream immediately — nothing after it is valid
         // (usage was already buffered; a trailing error is the queue closing).
@@ -354,8 +380,9 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         if (text) yield { type: 'text-delta', index: TEXT_INDEX, text } as StreamChunk;
       }
       for (const tool of [...parsed.tools, ...flushed.tools]) {
+        toolCount += 1;
         const callIndex = toolIndexState.next++;
-        const callId = `web_call_\${callIndex}`;
+        const callId = `web_call_${callIndex}`;
         yield { type: 'block-start', index: callIndex, blockType: 'tool-call' } as StreamChunk;
         yield {
           type: 'tool-call-delta', index: callIndex, id: callId,
@@ -372,14 +399,23 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       }
     }
 
-    if (!sawFinish) throw new LlmError('relay stream ended before finish', 'RELAY_INCOMPLETE');
-    return { usage: pendingUsage, rejections: xmlParser.rejections };
+    if (!sawFinish) throw new LlmError('relay stream ended before finish', 'STREAM_CLOSED');
+    return {
+      usage: pendingUsage,
+      rejections: xmlParser.rejections,
+      textChars: fullText.length,
+      toolCount,
+      reasoningChars,
+    };
   }
 }
 
 interface WebTurnOutcome {
   usage: { inputTokens: number; outputTokens: number } | null;
   rejections: readonly ToolRejection[];
+  textChars: number;
+  toolCount: number;
+  reasoningChars: number;
 }
 
 function addUsage(
@@ -389,6 +425,23 @@ function addUsage(
   if (a === null) return b;
   if (b === null) return a;
   return { inputTokens: a.inputTokens + b.inputTokens, outputTokens: a.outputTokens + b.outputTokens };
+}
+
+/**
+ * Wire error codes are relay-protocol names chosen on the extension side for
+ * their user-facing semantics; map them onto the official failure taxonomy so
+ * retry policy and surfaced diagnostics stay within BuiltinLlmFailureCode.
+ */
+const WIRE_CODE_TO_FAILURE: Record<string, BuiltinLlmFailureCode> = {
+  RATE_LIMIT: 'RATE_LIMIT',
+  WEB_AUTH: 'AUTH',
+  WEB_AUTH_EXPIRED: 'AUTH',
+  WEB_CONSUMER: 'INVALID_RESPONSE',
+  WEB_GENERATION: 'INVALID_RESPONSE',
+};
+
+function toLlmFailureCode(code: string): BuiltinLlmFailureCode {
+  return WIRE_CODE_TO_FAILURE[code] ?? 'INVALID_RESPONSE';
 }
 
 /** Model-facing label for one rejection reason. */
@@ -533,7 +586,7 @@ function buildToolInstructions(tools: NonNullable<GenerateOptions['tools']>, non
 }
 
 /** Flattens conversation history to readable text, newest-last. */
-function flattenHistory(messages: readonly Message[]): string {
+function flattenHistory(messages: GenerateOptions['messages']): string {
   const parts: string[] = [];
   for (const message of messages) {
     const shaped = message as { role?: unknown; content?: unknown };
