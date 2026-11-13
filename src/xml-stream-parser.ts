@@ -289,6 +289,17 @@ class XmlStreamingParser implements StreamingXmlParser {
       found?.index ?? Number.POSITIVE_INFINITY,
     );
 
+    // A stray `</tool>` closer with no open block (observed drift: the model
+    // closes the envelope twice, leaving a bare closer after the parsed
+    // blocks) carries no information — swallow it instead of leaking the tag
+    // into the visible text.
+    const stray = TOOL_ENVELOPE_CLOSE_RE.exec(text);
+    if (stray?.index !== undefined && stray.index < earliest) {
+      const before = text.slice(0, stray.index);
+      if (before.length > 0) result.textDeltas.push(before);
+      return text.slice(stray.index + (stray[0]?.length ?? 0));
+    }
+
     if (envelopeIndex !== undefined && envelopeIndex === earliest) {
       const opener = envelope?.[0] ?? '';
       const before = text.slice(0, envelopeIndex);
